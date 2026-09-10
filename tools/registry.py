@@ -331,8 +331,11 @@ def _check_fn_cached(fn: Callable) -> bool:
             return True
 
         # No recent success (or grace expired) — honor the failure; logged so silent tool
-        # loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
+        # loss in quiet mode (subagents) is diagnosable. A clean "returned False" just means
+        # the toolset isn't configured (no creds, feature off, nothing attached yet) — routine
+        # on every startup, so it's DEBUG; an unexpected exception stays WARNING.
+        log = logger.warning if outcome == "raised" else logger.debug
+        log(
             "check_fn %s %s; dependent tools will be unavailable this turn", _fn_label(fn), outcome)
         _check_fn_cache[cache_key] = (now, False)
         return False
