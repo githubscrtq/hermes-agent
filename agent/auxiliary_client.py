@@ -5697,9 +5697,28 @@ def _compression_fast_lane_controls(
     requested_provider: str | None, requested_model: str | None, route_config: Dict[str, Any],
     leak_guard_config: Dict[str, Any], max_tokens: int | None, extra_body: Dict[str, Any],
 ) -> tuple[int | None, Dict[str, Any]]:
-    """Apply the certified compression controls to one resolved route."""
-    if task != "compression" or max_tokens is not None:
+    """Apply certified compression controls to one resolved route.
+
+    Compression is a bounded auxiliary task.  An explicit caller-provided
+    max_tokens value must never bypass the compression safety ceiling.
+    """
+    if task != "compression":
         return max_tokens, extra_body
+
+    # Universal DGX-Spark compression ceiling.  Explicit caller values may
+    # LOWER this cap, but may never raise it.
+    configured_cap = route_config.get("max_tokens", 4096)
+    try:
+        compression_cap = max(512, min(int(configured_cap), 4096))
+    except (TypeError, ValueError):
+        compression_cap = 4096
+
+    if max_tokens is not None:
+        try:
+            max_tokens = max(1, min(int(max_tokens), compression_cap))
+        except (TypeError, ValueError):
+            max_tokens = compression_cap
+
     body = dict(extra_body)
     lane = resolve_compression_fast_lane(
         actual_provider, actual_model, requested_provider=requested_provider, requested_model=requested_model, route_config=route_config,
@@ -5709,7 +5728,17 @@ def _compression_fast_lane_controls(
             body["reasoning"] = lane.reasoning_config
     elif _compression_config_claims_fast_lane(leak_guard_config):
         body.pop("reasoning", None)
-    return max_tokens, body
+
+    lane_cap = lane.max_tokens
+    if lane_cap is None:
+        lane_cap = compression_cap
+    else:
+        lane_cap = min(int(lane_cap), compression_cap)
+
+    if max_tokens is not None:
+        lane_cap = min(int(max_tokens), lane_cap)
+
+    return lane_cap, body
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
@@ -5919,9 +5948,22 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
     NVIDIA NIM (empty choices[] when omitted); MoA reference slots; Gemini native (fixed 65,535
     ceiling otherwise); OpenRouter (budgets the FULL window when omitted → 402 on low credit);
     managed local llama-server (uncapped decode with no EOS burns the GPU to the context window).
+    Compression calls to a custom loopback OpenAI-compatible endpoint must also forward their
+    already-bounded task cap; otherwise the local server may fall back to its model/default
+    output ceiling.
     """
+    local_custom_compression = (
+        str(task or "") == "compression"
+        and provider_norm == "custom"
+        and (
+            base_url_host_matches(effective_base, "127.0.0.1")
+            or base_url_host_matches(effective_base, "localhost")
+            or base_url_host_matches(effective_base, "::1")
+        )
+    )
     return (
-        _is_anthropic_compat_endpoint(provider, effective_base)
+        local_custom_compression
+        or _is_anthropic_compat_endpoint(provider, effective_base)
         or _nous_on_messages_wire(provider_norm, model)
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
@@ -6677,9 +6719,15 @@ def _prepare_aux_request(
     )
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
+    # Universal task-level compression cap. Applied before request kwargs are built so it
+    # protects the sync path regardless of provider; an explicit caller value may only lower it,
+    # never raise it (see _compression_fast_lane_controls). Restored 2026-09-08 after v0.21.1
+    # discarded the returned cap here (`_, effective_extra_body = ...`), which silently
+    # neutralized the compression ceiling even though the helper computed it correctly.
+    effective_max_tokens = max_tokens
     if not async_mode:
         compression_config = _get_auxiliary_task_config("compression") if task == "compression" else {}
-        _, effective_extra_body = _compression_fast_lane_controls(
+        effective_max_tokens, effective_extra_body = _compression_fast_lane_controls(
             task, actual_provider=request_provider, actual_model=final_model,
             requested_provider=provider, requested_model=model, route_config=compression_config,
             leak_guard_config=compression_config, max_tokens=max_tokens,
@@ -6698,7 +6746,7 @@ def _prepare_aux_request(
     # Client's actual base_url so endpoint-specific temperature overrides work on
     # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
     kwargs = _build_call_kwargs(
-        request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
+        request_provider, final_model, messages, temperature=temperature, max_tokens=effective_max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task)
     if extra_headers:

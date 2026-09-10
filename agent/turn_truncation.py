@@ -326,7 +326,12 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
         _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _tc_requested_cap is not None:
             _tc_boost = max(_tc_boost, _tc_requested_cap)
-        agent._ephemeral_max_output_tokens = min(_tc_boost, max(32768, _tc_requested_cap or 0))
+        # DGX-Spark policy: truncated-tool-call continuation may temporarily exceed
+        # the normal 8192-token cap, but must never exceed 16384.
+        _tc_cap = 16384
+        if _tc_requested_cap is not None:
+            _tc_cap = min(_tc_cap, max(int(_tc_requested_cap), 1))
+        agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_cap)
         return st.done("continue")  # don't append the broken response
     agent._flush_status_buffer()
     if st.is_stub:

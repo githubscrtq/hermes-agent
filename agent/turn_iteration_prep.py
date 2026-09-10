@@ -500,7 +500,11 @@ def apply_retry_restarts(
         _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _requested_cap is not None:
             _boost = max(_boost, _requested_cap)
-        _boost_cap = max(32768, _requested_cap or 0)
+        # DGX-Spark policy: continuation may temporarily exceed the normal
+        # 8192-token cap, but must never exceed 16384.
+        _boost_cap = 16384
+        if _requested_cap is not None:
+            _boost_cap = min(_boost_cap, max(int(_requested_cap), 1))
         agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
         return _verdict("continue")
 

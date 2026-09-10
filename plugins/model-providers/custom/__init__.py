@@ -66,8 +66,15 @@ custom = CustomProfile(
     name="custom", aliases=("ollama", "local", "vllm", "llamacpp", "llama.cpp", "llama-cpp"),
     env_vars=(),  # No fixed key — custom endpoint
     base_url="",  # User-configured
-    # An arbitrary client ceiling can exceed a local server's actual output limit.
-    # The endpoint owns its generation default.
+    # Floor only (user model.max_tokens overrides); without it Ollama falls
+    # back to num_predict=128 and truncates.
+    # Without this, no max_tokens is sent and Ollama falls back to its internal num_predict=128, truncating
+    # responses after a few tokens (#39281). This is only a floor used when the user hasn't set
+    # model.max_tokens — they can override per-model — so we set it generously rather than lowballing it.
+    # Restored 2026-09-08 after v0.21.1 removed it (see HERMES_OUTPUT_CAP_REGRESSION_FIX_2026-09-07.md /
+    # HERMES_AUTO_RESET_ROOT_CAUSE_2026-09-07.md): removing this argument does not lower the cap, it
+    # removes it entirely, which is a safety regression, not a simplification.
+    default_max_tokens=8192,
 )
 
 register_provider(custom)

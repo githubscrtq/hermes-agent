@@ -292,10 +292,9 @@ def _clamp_output_cap(st: _Recovery, _retry: TurnRetryState, available_out: int,
         f"(provider_available={available_out:,}, estimated_request_tokens={request_input_estimate:,}; "
         f"context_length unchanged at {old_ctx:,})"
     )
-    # Still count against compression_attempts so a recurring error can't loop forever.
-    exhausted = st.count_attempt()
-    if exhausted is not None:
-        return exhausted
+    # An output-cap error is not itself a compression failure. Do not burn the shared
+    # compression-attempt budget merely for clamping max_tokens; the provider retry
+    # machinery remains bounded independently.
     # Also compress history so the retry doesn't spin on max_tokens alone; dropping the
     # middle window makes the total fit. Compression must never turn an output-cap error
     # fatal — on error, fall through and retry on max_tokens alone.
