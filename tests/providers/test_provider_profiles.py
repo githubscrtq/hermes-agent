@@ -88,6 +88,17 @@ class TestKimiProfile:
 
 
 class TestOpenRouterProfile:
+    def test_default_max_tokens_is_capped(self):
+        """Regression for the DGX/OpenRouter 402 (2026-09-10): an unset default_max_tokens lets
+        OpenRouter fill in a routed model's own output ceiling (e.g. 64000 for
+        anthropic/claude-sonnet-4) when no per-request max_tokens is given -- unrelated to the
+        account's remaining credit balance. Hit hardest on fallback_model/fallback_providers,
+        which never set a per-entry max_tokens override."""
+        p = get_provider_profile("openrouter")
+        assert p.default_max_tokens is not None
+        assert p.default_max_tokens <= 8192
+        assert p.get_max_tokens("anthropic/claude-sonnet-4") == p.default_max_tokens
+
     def test_extra_body_with_prefs(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})

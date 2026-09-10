@@ -199,6 +199,14 @@ openrouter = OpenRouterProfile(
     name="openrouter", aliases=("or",), env_vars=("OPENROUTER_API_KEY",), display_name="OpenRouter",
     description="OpenRouter — unified API for 200+ models", signup_url="https://openrouter.ai/keys",
     base_url="https://openrouter.ai/api/v1", models_url="https://openrouter.ai/api/v1/models",
+    # Without an explicit cap, an omitted request-level max_tokens leaves OpenRouter to fill in
+    # the routed model's own output ceiling (e.g. 64000 for anthropic/claude-sonnet-4) so it can
+    # satisfy upstreams like Anthropic that require max_tokens on every call. That ceiling is
+    # unrelated to the account's remaining balance, so a low-credit account gets an HTTP 402
+    # ("requested up to 64000 tokens, but can only afford N") instead of a normal completion --
+    # hits hardest on the fallback_model / fallback_providers failover path, which never sets an
+    # explicit per-entry max_tokens. Match the local/custom provider's 8192 safety ceiling instead.
+    default_max_tokens=8192,
     fallback_models=(
         "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "deepseek/deepseek-chat", "google/gemini-3.8-flash",
         "google/gemini-3.7-flash", "qwen/qwen3-plus",
