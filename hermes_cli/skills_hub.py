@@ -238,8 +238,55 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
     return first_meta, None, first_meta_source
 
 
+def _github_source_from(sources):
+    """The router's GitHubSource (shares its tree cache), or a fresh one when the caller passed none."""
+    from tools.skills_hub_github import GitHubAuth, GitHubSource
+    return next((src for src in sources if isinstance(src, GitHubSource)), None) or GitHubSource(GitHubAuth())
+
+
+def _github_url_identifier(identifier: str, sources, c) -> Optional[str]:
+    """Hub identifier for a pasted GitHub URL, "" when it names no installable skill, or None when
+    ``identifier`` is not a GitHub URL at all (the caller then treats it as a name/identifier).
+
+    A repo URL with no in-repo path is resolved against the repo tree: exactly one SKILL.md installs
+    straight away, several are listed so the user picks one.
+    """
+    from tools.skills_hub_github import parse_github_url
+    parsed = parse_github_url(identifier)
+    if parsed is None:
+        return None
+    repo, skill_path = parsed
+    if skill_path:
+        return f"{repo}/{skill_path}"
+    github = _github_source_from(sources)
+    candidates = github.list_skill_dirs_in_repo_tree(repo)
+    if len(candidates) == 1:
+        c.print(f"[dim]Resolved to: {candidates[0]}[/]")
+        return candidates[0]
+    if len(candidates) > 1:
+        c.print(f"\n[yellow]{repo} ships {len(candidates)} skills — install one by its full identifier:[/]")
+        for candidate in candidates[:20]:
+            c.print(f"  [cyan]{candidate}[/]")
+        if len(candidates) > 20:
+            c.print(f"  [dim]... and {len(candidates) - 20} more[/]")
+        c.print()
+        return ""
+    if github.repo_has_root_skill(repo):
+        _print_error(c, f"{repo} keeps its SKILL.md at the repo root, which has no installable "
+                        f"sub-path. Install it by URL instead:\n"
+                        f"  hermes skills install https://raw.githubusercontent.com/{repo}/HEAD/SKILL.md")
+        return ""
+    _print_error(c, f"No SKILL.md found anywhere in {repo}. "
+                    f"Check the URL, or point at the skill directory directly "
+                    f"(e.g. https://github.com/{repo}/tree/main/skills/<name>).")
+    return ""
+
+
 def _full_identifier(identifier: str, sources, c) -> str:
     """Identifiers without a slash are short names; "" when they cannot be resolved."""
+    resolved = _github_url_identifier(identifier, sources, c)
+    if resolved is not None:
+        return resolved
     return identifier if "/" in identifier else _resolve_short_name(identifier, sources, c)
 
 

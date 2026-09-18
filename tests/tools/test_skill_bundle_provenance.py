@@ -604,3 +604,111 @@ def test_unified_search_trust_rank_survives_limit_cut():
         results = unified_search("s", [], source_filter="all", limit=10)
 
     assert results[0].identifier == "official/cat/s-official"
+
+
+def test_github_source_accepts_referenced_support_directory(monkeypatch):
+    """A SKILL.md linking one of its own support DIRECTORIES must still install.
+
+    Git trees list a directory as ``type: tree``, which the old non-blob check lumped in with
+    symlinks — so every skill whose SKILL.md mentioned e.g. ``scripts/lib/`` was hard-rejected with
+    an unexplained "Could not download" (mvanhorn/last30days-skill).
+    """
+    source = GitHubSource(GitHubAuth())
+    skill_md = (
+        "---\nname: dir-ref\ndescription: d\n---\n"
+        "Modules live in `scripts/lib/` and docs in `references/`.\n"
+    )
+    monkeypatch.setattr(source, "_fetch_file_content", lambda _repo, path, ref=None: skill_md)
+    monkeypatch.setattr(source, "_fetch_file_bytes", lambda _repo, path, ref=None: b"x")
+    source._tree_cache["owner/repo"] = (
+        "main",
+        [
+            {"path": "skill/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "skill/scripts", "type": "tree", "mode": "040000"},
+            {"path": "skill/scripts/lib", "type": "tree", "mode": "040000"},
+            {"path": "skill/scripts/lib/search.py", "type": "blob", "mode": "100644"},
+            {"path": "skill/references", "type": "tree", "mode": "040000"},
+            {"path": "skill/references/guide.md", "type": "blob", "mode": "100644"},
+        ],
+    )
+
+    bundle = source.fetch("owner/repo/skill")
+
+    assert bundle is not None
+    assert set(bundle.files) == {"SKILL.md", "scripts/lib/search.py", "references/guide.md"}
+
+
+def test_github_source_still_rejects_symlinked_referenced_directory(monkeypatch):
+    """Directories are fine; a referenced path that is a SYMLINK stays a hard rejection."""
+    source = GitHubSource(GitHubAuth())
+    skill_md = "---\nname: link-ref\ndescription: d\n---\nModules live in `scripts/lib/`.\n"
+    monkeypatch.setattr(source, "_fetch_file_content", lambda _repo, path, ref=None: skill_md)
+    monkeypatch.setattr(source, "_fetch_file_bytes", lambda _repo, path, ref=None: b"x")
+    source._tree_cache["owner/repo"] = (
+        "main",
+        [
+            {"path": "skill/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "skill/scripts/lib", "type": "blob", "mode": "120000"},
+        ],
+    )
+
+    assert source.fetch("owner/repo/skill") is None
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://github.com/o/r", ("o/r", "")),
+    ("https://github.com/o/r/", ("o/r", "")),
+    ("https://www.github.com/o/r.git", ("o/r", "")),
+    ("github.com/o/r", ("o/r", "")),
+    ("git@github.com:o/r.git", ("o/r", "")),
+    ("https://github.com/o/r/tree/main/skills/foo", ("o/r", "skills/foo")),
+    ("https://github.com/o/r/blob/abc123/skills/foo/SKILL.md", ("o/r", "skills/foo")),
+    # Not installable GitHub skill URLs.
+    ("https://github.com/o/r/issues/12", None),
+    ("https://github.com/o", None),
+    ("https://gitlab.com/o/r", None),
+    ("https://example.com/x/SKILL.md", None),
+    ("openai/skills/skill-creator", None),
+    ("", None),
+])
+def test_parse_github_url(url, expected):
+    from tools.skills_hub_github import parse_github_url
+    assert parse_github_url(url) == expected
+
+
+def test_list_skill_dirs_in_repo_tree_skips_root_and_dot_dirs(monkeypatch):
+    source = GitHubSource(GitHubAuth())
+    source._tree_cache["owner/repo"] = (
+        "main",
+        [
+            {"path": "SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "skills/beta/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "skills/alpha/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "top/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": ".github/skills/x/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "_tpl/SKILL.md", "type": "blob", "mode": "100644"},
+            {"path": "linked/SKILL.md", "type": "blob", "mode": "120000"},
+        ],
+    )
+
+    # Shallowest first, then alphabetical; root SKILL.md is not a splittable identifier.
+    assert source.list_skill_dirs_in_repo_tree("owner/repo") == [
+        "owner/repo/top", "owner/repo/skills/alpha", "owner/repo/skills/beta",
+    ]
+    assert source.repo_has_root_skill("owner/repo") is True
+
+
+def test_github_url_identifier_resolves_single_skill_repo(monkeypatch):
+    from hermes_cli.skills_hub import _github_url_identifier
+    source = GitHubSource(GitHubAuth())
+    source._tree_cache["owner/repo"] = (
+        "main", [{"path": "skills/only/SKILL.md", "type": "blob", "mode": "100644"}],
+    )
+    console = Console(file=StringIO())
+
+    assert _github_url_identifier("https://github.com/owner/repo", [source], console) == "owner/repo/skills/only"
+    # An explicit in-repo path needs no tree lookup at all.
+    assert _github_url_identifier(
+        "https://github.com/owner/repo/tree/main/skills/only", [], console) == "owner/repo/skills/only"
+    # Non-GitHub identifiers are None so the caller keeps its own resolution.
+    assert _github_url_identifier("openai/skills/skill-creator", [], console) is None

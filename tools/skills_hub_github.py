@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -155,6 +155,56 @@ class GitHubAuth:
         return None
 
 
+GITHUB_HOSTS = ("github.com", "www.github.com")
+# Repo-relative URL segments that are GitHub UI routes, never skill directories.
+_GITHUB_REF_ROUTES = ("tree", "blob")
+
+
+def parse_github_url(value: str) -> Optional[Tuple[str, str]]:
+    """``(owner/repo, in-repo skill path)`` for a GitHub URL, or None when ``value`` is not one.
+
+    Accepts what people actually paste out of a README: ``https://github.com/o/r``,
+    ``.../tree/<ref>/skills/foo``, ``.../blob/<ref>/skills/foo/SKILL.md``, the scheme-less
+    ``github.com/o/r`` and the SSH clone form ``git@github.com:o/r.git``. The returned path is ``""``
+    when the URL names only a repo, leaving the caller to discover the skill directory from the tree.
+    Hub identifiers are ``owner/repo/path``, so without this a pasted URL split into the nonexistent
+    repo ``https:/`` and failed as an unexplained "Could not download".
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("git@"):
+        host, sep, rest = raw[len("git@"):].partition(":")
+        if not sep or host.lower() not in GITHUB_HOSTS:
+            return None
+        path = rest
+    else:
+        try:
+            parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        except ValueError:
+            return None
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() not in GITHUB_HOSTS:
+            return None
+        path = parsed.path
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, repo, rest_parts = parts[0], parts[1], parts[2:]
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    if rest_parts:
+        # ``/tree/<ref>/...`` and ``/blob/<ref>/...`` carry a ref the identifier has no slot for; any
+        # other trailing segment (/issues, /releases, /pulls) is a UI route, not a skill path.
+        if len(rest_parts) < 2 or rest_parts[0] not in _GITHUB_REF_ROUTES:
+            return None
+        rest_parts = rest_parts[2:]
+    if rest_parts and rest_parts[-1].lower() == "skill.md":
+        rest_parts = rest_parts[:-1]
+    if not owner or not repo or any(part in (".", "..") for part in rest_parts):
+        return None
+    return f"{owner}/{repo}", "/".join(rest_parts)
+
+
 def _split_repo_id(identifier: str) -> Optional[Tuple[str, str]]:
     """``owner/repo/path/to/skill`` -> ``(owner/repo, path/to/skill)``; None when too short."""
     parts = identifier.split("/", 2)
@@ -167,14 +217,23 @@ def _skip_bundle_file(rel_path: str) -> bool:
     return base.startswith(".") or base.endswith(".pyc") or "__pycache__" in rel_path.split("/")
 
 
+def _tree_member_kind(item: dict) -> str:
+    """``"blob"`` (regular file), ``"tree"`` (directory), or ``"other"`` (symlink, submodule, gitlink).
+    Symlinks are blobs carrying mode 120000, so the mode test has to come before the type test."""
+    if item.get("mode") == "120000":
+        return "other"
+    kind = item.get("type")
+    return kind if kind in ("blob", "tree") else "other"
+
+
 def _tree_members(entries: List[dict], prefix: str):
-    """``(rel_path, item_path, is_regular_blob)`` for every git-tree entry under ``prefix``. Symlinks
-    (mode 120000) and non-blobs report ``is_regular_blob=False`` so callers can reject a SKILL.md-linked
-    symlink instead of silently following it."""
+    """``(rel_path, item_path, kind)`` for every git-tree entry under ``prefix``, ``kind`` being
+    ``"blob"``, ``"tree"`` or ``"other"``. Callers must never follow an ``"other"`` entry a SKILL.md
+    links to; a ``"tree"`` is an ordinary directory whose files are yielded as their own blobs."""
     for item in entries:
         item_path = item.get("path", "")
         if item_path.startswith(prefix):
-            yield item_path[len(prefix):], item_path, item.get("type") == "blob" and item.get("mode") != "120000"
+            yield item_path[len(prefix):], item_path, _tree_member_kind(item)
 
 
 class GitHubSource(SkillSource):
@@ -306,8 +365,12 @@ class GitHubSource(SkillSource):
         is a dangling link (repo-only dev tool, prose over-match): warn and install without it."""
         prefix = f"{skill_path}/"
         symlinked: set = set()
-        for rel_path, item_path, regular in _tree_members(entries, prefix):
-            if not regular:
+        directories: set = set()
+        for rel_path, item_path, kind in _tree_members(entries, prefix):
+            if kind == "tree":
+                directories.add(rel_path)
+                continue
+            if kind != "blob":
                 symlinked.add(rel_path)
                 continue
             if rel_path == "SKILL.md" or _skip_bundle_file(rel_path):
@@ -328,6 +391,12 @@ class GitHubSource(SkillSource):
             if rel_path in symlinked:
                 logger.warning("Rejected non-regular referenced file in skill bundle: %s%s", prefix, rel_path)
                 return False
+            if rel_path in directories:
+                # SKILL.md links a support DIRECTORY (``scripts/lib/``, ``references/``). Its files are
+                # already collected by the tree walk above, so there is nothing to fetch and nothing
+                # dangling. Directories used to be lumped in with symlinks, which hard-rejected every
+                # skill whose SKILL.md named one of its own support dirs.
+                continue
             if rel_path not in files:
                 logger.warning(
                     "Referenced skill support file is missing; continuing without it: %s%s", prefix, rel_path)
@@ -474,6 +543,34 @@ class GitHubSource(SkillSource):
             if entry.get("type") == "blob" and (path.endswith(skill_md_suffix) or path == skill_md_suffix[1:]):
                 return f"{repo}/{path[: -len('/SKILL.md')]}"
         return None
+
+    def list_skill_dirs_in_repo_tree(self, repo: str) -> List[str]:
+        """Every ``owner/repo/path`` in ``repo`` holding a SKILL.md — one cached tree call.
+
+        Backs installing from a bare repo URL, where the skill's in-repo path is unknown. Sorted
+        shallowest-first so a repo's real skill outranks a nested fixture. A repo-root SKILL.md is
+        skipped: ``owner/repo`` is not a splittable hub identifier, and the caller handles that shape
+        separately. Dot/underscore path segments (``.github/``, ``_templates/``) never hold skills.
+        """
+        if (cached := self._get_repo_tree(repo)) is None:
+            return []
+        found = set()
+        for entry in cached[1]:
+            path = entry.get("path", "")
+            if _tree_member_kind(entry) != "blob" or not path.endswith("/SKILL.md"):
+                continue
+            skill_dir = path[: -len("/SKILL.md")]
+            if any(part.startswith((".", "_")) for part in skill_dir.split("/")):
+                continue
+            found.add(f"{repo}/{skill_dir}")
+        return sorted(found, key=lambda ident: (ident.count("/"), ident))
+
+    def repo_has_root_skill(self, repo: str) -> bool:
+        """True when ``repo`` keeps its SKILL.md at the tree root (no installable sub-path)."""
+        cached = self._get_repo_tree(repo)
+        return bool(cached) and any(
+            entry.get("path") == "SKILL.md" and _tree_member_kind(entry) == "blob" for entry in cached[1]
+        )
 
     def _fetch_file_content(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
         """Fetch a single text file from GitHub (None on miss or non-UTF-8)."""

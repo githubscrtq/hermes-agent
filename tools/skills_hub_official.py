@@ -175,8 +175,8 @@ class OptionalSkillSource(SkillSource):
         if tree is None:
             return None
         files: Dict[str, Union[str, bytes]] = {}
-        for rel_file, item_path, regular in _tree_members(tree[1], f"{self.OPTIONAL_SKILLS_PREFIX}/{rel}/"):
-            if not regular or _skip_bundle_file(rel_file):
+        for rel_file, item_path, kind in _tree_members(tree[1], f"{self.OPTIONAL_SKILLS_PREFIX}/{rel}/"):
+            if kind != "blob" or _skip_bundle_file(rel_file):
                 continue
             content = github._fetch_file_bytes(self.OFFICIAL_REPO, item_path)
             if content is None:
